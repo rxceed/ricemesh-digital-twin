@@ -1,0 +1,1 @@
+export { buildElevRange, buildInitialGrid, simulationTick, plotWaterLevel } from "./physics.logic";
