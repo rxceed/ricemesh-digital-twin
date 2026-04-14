@@ -46,6 +46,10 @@
  *   Nothing else changes.
  */
 
+// Imports
+import type { I_cell, I_plot_properties, I_canal_properties, I_terrain_properties, I_map } from "../models";
+import { CELL_TYPE } from "../models";
+
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 
 /**
@@ -60,24 +64,38 @@ export const CANAL_DEPTH = 2.0;
 /**
  * createCell — factory for a single grid cell.
  *
- * @param {number} col
  * @param {number} row
+ * @param {number} col
  * @param {object} props  — { elevation, ...anyFutureProps }
  * @param {string} type   — 'terrain' | 'canal' | 'source'
  * @returns {Cell}
  */
-export function createCell(col, row, props = {}, type = "terrain") {
-    return {
-    id: `${col}_${row}`,
-    col,
-    row,
-    type,
-    waterLevel: 0,
-    props: {
-      elevation: 5,   // sensible default; caller always overrides
-      ...props,       // ← future props land here automatically
-    },
-    };
+export function createCell(row: number, col: number, props: I_plot_properties | I_terrain_properties | I_canal_properties, type = "terrain") {
+  let cell_id: string;
+  if(type === "terrain")
+  {
+    cell_id = `t_${col}_${row}`;
+  }
+  else if(type === "canal")
+  {
+    cell_id = `c_${col}_${row}`;
+  }
+  else if(type === "plot")
+  {
+    cell_id = `p_${col}_${row}`;
+  }
+  else
+  {
+    cell_id = `u_${col}_${row}`
+  };
+  const cell: I_cell = {
+    id: cell_id,
+    col: col,
+    row: row,
+    type: type,
+    properties: props
+  }
+    return cell
 }
 
 // ── ELEVATION MAP ─────────────────────────────────────────────────────────
@@ -94,18 +112,61 @@ export function createCell(col, row, props = {}, type = "terrain") {
  * @param {number} rows
  * @returns {number[]}  flat array, index = row * cols + col
  */
-export function buildElevationMap(cols, rows) {
-  const map = [];
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      // Primary slope: 12 m at top → 2 m at bottom
-      const slope = 12 - (row / (rows - 1)) * 10;
-      // Lateral bowl: sin curve peaks at center, 1.2 m amplitude
-      const lateral = Math.sin((col / (cols - 1)) * Math.PI) * 1.2;
-      map.push(+(slope + lateral).toFixed(2));
+/*
+export function buildElevationMap(cols: number, rows: number, dummy:boolean=false, elevation_data:Array<Array<number>>=[[]]) {
+  const map:Array<number> = [];
+  if(dummy == true)
+  {
+    for (let row = 0; row < rows; row++) 
+    {
+      for (let col = 0; col < cols; col++) 
+      {
+        // Primary slope: 12 m at top → 2 m at bottom
+        const slope = 12 - (row / (rows - 1)) * 10;
+        // Lateral bowl: sin curve peaks at center, 1.2 m amplitude
+        const lateral = Math.sin((col / (cols - 1)) * Math.PI) * 1.2;
+        map.push(+(slope + lateral).toFixed(2));
+      }
     }
   }
+  else
+  {
+    for(let row = 0; row < rows; row++)
+    {
+      for(let col = 0; col < cols; col++)
+      {
+        const elevRow = elevation_data[row]
+        if(elevRow) map.push(elevRow[col] ?? 0)
+      }
+    }
+  }
+  
   return map;
+}
+*/
+
+/**
+ * 
+ * @param {number} cols 
+ * @param {number} rows 
+ * @param {map_data[][]} map_data   [[{elevation, type}],...] 
+ * @returns {number[], string[]}  flat array
+ */
+export function buildMap(rows: number, cols: number, map_data: Array<Array<I_map>>)
+{
+  const elevationMap: Array<number> = [];
+  const typeMap: Array<string> = [];
+  for(let row = 0; row < rows; row++)
+  {
+    if(!map_data[row]) break;
+    for(let col = 0; col < cols; col++)
+    {
+      if(!(map_data[row]![col])) break;
+      elevationMap.push(map_data[row]![col]!.elevation)
+      typeMap.push(map_data[row]![col]!.type)
+    }
+  }
+  return {elevationMap, typeMap}
 }
 
 // ── GRID BUILDER ──────────────────────────────────────────────────────────
@@ -121,11 +182,11 @@ export function buildElevationMap(cols, rows) {
  * @param {number}     cols
  * @param {number}     rows
  * @param {number[]}   elevMap       from buildElevationMap
- * @param {number[][]} canalCoords   [[col, row], ...]
- * @param {number[][]} sourceCoords  [[col, row], ...]
- * @returns {Cell[]}
+ * @param {string[]}   typeMap
+ * @returns {Cell[]}   flat Cell array, coord = rows * cols + col
  */
-export function buildGrid(cols, rows, elevMap, canalCoords, sourceCoords) {
+export function buildGrid(rows: number, cols: number, elevMap: Array<number>, typeMap: Array<string>) {
+  /*
   const canalSet  = new Set(canalCoords.map( ([c, r]) => `${c}_${r}`));
   const sourceSet = new Set(sourceCoords.map(([c, r]) => `${c}_${r}`));
 
@@ -135,8 +196,8 @@ export function buildGrid(cols, rows, elevMap, canalCoords, sourceCoords) {
     const key = `${col}_${row}`;
 
     const type = sourceSet.has(key) ? "source"
-               : canalSet.has(key)  ? "canal"
-               : "terrain";
+                : canalSet.has(key)  ? "canal"
+                : "terrain";
 
     // Canal cells are dug below surrounding terrain
     const elevation = canalSet.has(key)
@@ -145,6 +206,37 @@ export function buildGrid(cols, rows, elevMap, canalCoords, sourceCoords) {
 
     return createCell(col, row, { elevation }, type);
   });
+  */
+  const cells: Array<I_cell> = []
+  for(let row = 0; row < rows; row++)
+  {
+    for(let col = 0; col < cols; col++)
+    {
+      const type: string = typeMap[row*col+col] ?? "null";
+      const elevation: number = elevMap[row*col+col] ?? -1;
+      if(type === "null") cells.push(createCell(col, row, {elevation: -1}, type))
+      else if(type === "terrain") cells.push(createCell(col, row, {elevation: elevation}, type))
+      switch(type) {
+        case "null":
+          cells.push(createCell(row, col, {elevation: -1}, type))
+          break;
+        case "terrain":
+          cells.push(createCell(row, col, {elevation: elevation}, type))
+          break;
+        case "plot":
+          cells.push(createCell(row, col, {waterLevel: 0, elevation: elevation}, type))
+          break;
+        case "canal":
+          cells.push(createCell(row, col, {waterLevel: 1, elevation: elevation}, type))
+          break;
+        default:
+          cells.push(createCell(col, row, {elevation: -1}, "null"))
+          break;
+      }
+    }
+    return cells
+  }
+  
 }
 
 // ── NEIGHBOR LOOKUP ───────────────────────────────────────────────────────
