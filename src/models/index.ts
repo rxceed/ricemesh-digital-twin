@@ -1,2 +1,2 @@
-export * from "./cell.model"
-export * from "./map.model"
+export * from "./cell.model";
+export * from "./map.model";

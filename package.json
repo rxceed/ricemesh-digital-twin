@@ -9,6 +9,7 @@
     "start": "NODE_ENV=production bun src/index.ts"
   },
   "dependencies": {
+    "geotiff": "^3.0.5",
     "react": "^19",
     "react-dom": "^19"
   },

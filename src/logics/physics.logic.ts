@@ -1,264 +1,254 @@
 /**
- * physics.js
+ * physics.logic.ts
  *
  * Grid model and cellular-automaton water flow simulation.
  *
- * Imports: NONE. This module is pure JavaScript — no React, no canvas,
- * no external libraries. It can run in Node.js, a web worker, or a
- * server-side batch job without changes.
+ * Imports: models only.  No React, no canvas, no external libraries.
+ * This module can run in Node.js, a web worker, or server-side.
  *
  * ── Data model ───────────────────────────────────────────────────────────
  *
- * Grid   : flat array of Cell objects, length = cols × rows.
+ * Grid   : flat array of I_cell, length = cols × rows.
  *          Index formula:  idx = row * cols + col
  *
- * Cell   : {
- *   id          string    "${col}_${row}"
- *   col         number
- *   row         number
- *   type        'terrain' | 'canal' | 'source'
- *   waterLevel  number    0.0 – 1.0
- *   props       object    extensible property bag — see below
+ * I_cell : {
+ *   id          "{prefix}_{row}_{col}"  — row-first (2D array convention),
+ *               prefix = t/c/p/s for terrain/canal/plot/source
+ *   col, row    number
+ *   type        'terrain' | 'canal' | 'source' | 'plot'
+ *   waterLevel  0.0 – 1.0
+ *   props       I_cell_props   extensible numeric property bag
  * }
  *
- * props bag: the only coupling between the physics engine and the data.
- *   Currently used:
- *     props.elevation  number  metres above sea level
+ * props bag:  add any numeric field; physics reads it via options.elevationKey.
+ *   Current:   elevation   metres above sea level
+ *   Future:    permeability, roughness, cropStage, etc.
  *
- *   Future properties — just add them here, physics reads them via
- *   options.elevationKey (and future option keys):
- *     props.permeability  number  0–1, soil infiltration rate
- *     props.soilType      string  'clay' | 'loam' | 'sand'
- *     props.cropStage     number  0–4, affects evapotranspiration
- *     props.roughness     number  Manning's n for Bernoulli upgrade
+ * ── Elevation model ───────────────────────────────────────────────────────
+ *
+ * The elevation stored in mapData is the BASE terrain elevation.
+ * buildGrid then applies depth offsets per cell type:
+ *
+ *   source  → no offset  (highest point)
+ *   canal   → base − CANAL_DEPTH  (preferred flow corridor, trench)
+ *   plot    → base − PLOT_DEPTH   (paddy-field basin, deeper than canal)
+ *   terrain → no offset
+ *
+ * Why PLOT_DEPTH > CANAL_DEPTH:
+ *   Canal endpoints are adjacent to plots. For irrigation to work correctly
+ *   (canal → plot direction), canals must be HIGHER than adjacent plots.
+ *   CANAL_DEPTH=2m, PLOT_DEPTH=2.5m ensures this throughout the grid.
+ *
+ * ── Flow restriction ─────────────────────────────────────────────────────
+ *
+ * Water ONLY flows through: source, canal, plot cells.
+ * Terrain cells are inert — they neither hold nor transmit water.
+ * This, combined with the depth model, gives correct irrigation flow:
+ *   source → canal → plot
  *
  * ── Physics overview ─────────────────────────────────────────────────────
  *
  * Naive rule (current):
- *   For each wet cell, water flows to each lower-elevation neighbor.
+ *   For each wet cell, water flows to each lower-elevation neighbour.
  *   Amount proportional to elevation difference (hydraulic gradient proxy).
  *
- * Upgrade path — Bernoulli (future):
+ * Bernoulli upgrade path (future):
  *   Replace the `amount` line in computeFlows:
- *     const v   = Math.sqrt(2 * 9.81 * elevDiff);       // Bernoulli velocity
- *     const Q   = v * edge.crossSection;                  // m³/s
- *     const amt = (Q * tickMs/1000) / cellCapacity_m3;  // normalised 0-1
+ *     const v   = Math.sqrt(2 * 9.81 * elevDiff);        // velocity
+ *     const Q   = v * (options.crossSection ?? 1);         // m³/s
+ *     const amt = (Q * (options.tickMs ?? 160) / 1000)
+ *                 / (options.cellCapacity ?? 100);          // normalised
  *   Nothing else changes.
  */
 
-// Imports
-import type { I_cell, I_plot_properties, I_canal_properties, I_terrain_properties, I_map } from "../models";
-import { CELL_TYPE } from "../models";
+import type { I_cell, I_cell_props, CellType } from "../models";
+import type { I_map, I_network_data }          from "../models";
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────
 
 /**
- * CANAL_DEPTH — how many metres canal cells are dug below surrounding terrain.
- * Creates a preferred gravity-flow corridor without special-casing in the
- * physics logic. Real canals work the same way.
+ * CANAL_DEPTH — metres canal cells are dug below surrounding terrain.
+ * Makes canals preferred flow paths (lower than adjacent terrain).
  */
 export const CANAL_DEPTH = 2.0;
+
+/**
+ * PLOT_DEPTH — metres plot cells sit below surrounding terrain.
+ * Must be > CANAL_DEPTH so that canal → plot gravity flow works:
+ *   canal elevation  = base − CANAL_DEPTH
+ *   plot  elevation  = base − PLOT_DEPTH   (lower → receives water)
+ */
+export const PLOT_DEPTH = 2.5;
 
 // ── CELL FACTORY ─────────────────────────────────────────────────────────
 
 /**
  * createCell — factory for a single grid cell.
  *
- * @param {number} row
- * @param {number} col
- * @param {object} props  — { elevation, ...anyFutureProps }
- * @param {string} type   — 'terrain' | 'canal' | 'source'
- * @returns {Cell}
+ * ID format: "{prefix}_{row}_{col}"
+ *   - Row before col follows 2D array convention (array[row][col]).
+ *   - Prefix gives type distinction at a glance in debug output:
+ *       t_ = terrain    c_ = canal
+ *       p_ = plot       s_ = source
+ *
+ * Gate-map keys and sourceIds in IrrigationDigitalTwin.tsx are built
+ * to match this format — see the component for details.
+ *
+ * @param col   column index
+ * @param row   row index
+ * @param props elevation and any future numeric properties
+ * @param type  cell type
  */
-export function createCell(row: number, col: number, props: I_plot_properties | I_terrain_properties | I_canal_properties, type = "terrain") {
-  let cell_id: string;
-  if(type === "terrain")
-  {
-    cell_id = `t_${col}_${row}`;
-  }
-  else if(type === "canal")
-  {
-    cell_id = `c_${col}_${row}`;
-  }
-  else if(type === "plot")
-  {
-    cell_id = `p_${col}_${row}`;
-  }
-  else
-  {
-    cell_id = `u_${col}_${row}`
-  };
-  const cell: I_cell = {
-    id: cell_id,
-    col: col,
-    row: row,
-    type: type,
-    properties: props
-  }
-    return cell
+
+const TYPE_PREFIX: Record<string, string> = {
+    terrain: "t",
+    canal:   "c",
+    plot:    "p",
+    source:  "s",
+};
+
+export function createCell(
+    col:   number,
+    row:   number,
+    props: Partial<I_cell_props> = {},
+    type:  string = "terrain"
+): I_cell {
+    const prefix = TYPE_PREFIX[type] ?? "u"; // 'u' = unknown, safety fallback
+    return {
+        id:         `${prefix}_${row}_${col}`,
+        col,
+        row,
+        type:       type as CellType,
+        waterLevel: 0,
+        props: {
+            elevation: 5,   // sensible default; caller always overrides
+            ...props,       // future props land here without any refactoring
+        },
+    };
 }
 
-// ── ELEVATION MAP ─────────────────────────────────────────────────────────
+// ── MAP → FLAT ARRAYS ────────────────────────────────────────────────────
 
 /**
- * buildElevationMap — generates a smooth slope + lateral bowl.
+ * buildMap — converts a 2D I_map array into parallel flat arrays.
  *
- * Row 0   = high elevation (reservoir / intake end).
- * Row N-1 = low elevation (farm basin end).
- * Center columns slightly higher than edges → water drains outward
- * toward the lateral plot wings, matching typical Javanese sawah layout.
+ * Row-major order: index = row * cols + col.
+ * Outer loop = rows, inner loop = cols.
  *
- * @param {number} cols
- * @param {number} rows
- * @returns {number[]}  flat array, index = row * cols + col
+ * @param rows     number of grid rows
+ * @param cols     number of grid columns
+ * @param mapData  I_map[row][col] — elevation and type per cell
+ * @returns        { elevationMap, typeMap }  flat index arrays
  */
-/*
-export function buildElevationMap(cols: number, rows: number, dummy:boolean=false, elevation_data:Array<Array<number>>=[[]]) {
-  const map:Array<number> = [];
-  if(dummy == true)
-  {
-    for (let row = 0; row < rows; row++) 
-    {
-      for (let col = 0; col < cols; col++) 
-      {
-        // Primary slope: 12 m at top → 2 m at bottom
-        const slope = 12 - (row / (rows - 1)) * 10;
-        // Lateral bowl: sin curve peaks at center, 1.2 m amplitude
-        const lateral = Math.sin((col / (cols - 1)) * Math.PI) * 1.2;
-        map.push(+(slope + lateral).toFixed(2));
-      }
-    }
-  }
-  else
-  {
-    for(let row = 0; row < rows; row++)
-    {
-      for(let col = 0; col < cols; col++)
-      {
-        const elevRow = elevation_data[row]
-        if(elevRow) map.push(elevRow[col] ?? 0)
-      }
-    }
-  }
-  
-  return map;
-}
-*/
+export function buildMap(
+    rows:    number,
+    cols:    number,
+    mapData: I_map[][]
+): { elevationMap: number[]; typeMap: string[] } {
+    const elevationMap: number[] = [];
+    const typeMap:      string[] = [];
 
-/**
- * 
- * @param {number} cols 
- * @param {number} rows 
- * @param {map_data[][]} map_data   [[{elevation, type}],...] 
- * @returns {number[], string[]}  flat array
- */
-export function buildMap(rows: number, cols: number, map_data: Array<Array<I_map>>)
-{
-  const elevationMap: Array<number> = [];
-  const typeMap: Array<string> = [];
-  for(let row = 0; row < rows; row++)
-  {
-    if(!map_data[row]) break;
-    for(let col = 0; col < cols; col++)
-    {
-      if(!(map_data[row]![col])) break;
-      elevationMap.push(map_data[row]![col]!.elevation)
-      typeMap.push(map_data[row]![col]!.type)
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            const cell = mapData[row]?.[col];
+            elevationMap.push(cell?.elevation ?? 5);
+            typeMap.push(cell?.type ?? "terrain");
+        }
     }
-  }
-  return {elevationMap, typeMap}
+
+    return { elevationMap, typeMap };
 }
 
 // ── GRID BUILDER ──────────────────────────────────────────────────────────
 
 /**
- * buildGrid — construct the full grid from an elevation map and
- * sets of canal and source coordinates.
+ * buildGrid — constructs the full Cell array from flat elevation/type arrays.
  *
- * Canal cells have their elevation lowered by CANAL_DEPTH so the
- * physics engine naturally prefers them as flow corridors — no
- * special-casing required in computeFlows.
+ * Applies depth offsets per cell type (see module docstring for rationale):
+ *   canal  → base elevation − CANAL_DEPTH
+ *   plot   → base elevation − PLOT_DEPTH
+ *   others → base elevation unchanged
  *
- * @param {number}     cols
- * @param {number}     rows
- * @param {number[]}   elevMap       from buildElevationMap
- * @param {string[]}   typeMap
- * @returns {Cell[]}   flat Cell array, coord = rows * cols + col
+ * @param rows     number of grid rows
+ * @param cols     number of grid columns
+ * @param elevMap  flat elevation array (row-major)
+ * @param typeMap  flat type array (row-major)
+ * @returns        flat I_cell array, index = row * cols + col
  */
-export function buildGrid(rows: number, cols: number, elevMap: Array<number>, typeMap: Array<string>) {
-  /*
-  const canalSet  = new Set(canalCoords.map( ([c, r]) => `${c}_${r}`));
-  const sourceSet = new Set(sourceCoords.map(([c, r]) => `${c}_${r}`));
+export function buildGrid(
+    rows:    number,
+    cols:    number,
+    elevMap: number[],
+    typeMap: string[]
+): I_cell[] {
+    const cells: I_cell[] = [];
 
-  return Array.from({ length: cols * rows }, (_, idx) => {
-    const col = idx % cols;
-    const row = Math.floor(idx / cols);
-    const key = `${col}_${row}`;
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            const idx      = row * cols + col;   // ← correct row-major index
+            const type     = typeMap[idx]  ?? "terrain";
+            const baseElev = elevMap[idx]  ?? 5;
 
-    const type = sourceSet.has(key) ? "source"
-                : canalSet.has(key)  ? "canal"
-                : "terrain";
+            // Apply per-type elevation offsets
+            const elevation =
+                type === "canal" ? baseElev - CANAL_DEPTH :
+                type === "plot"  ? baseElev - PLOT_DEPTH  :
+                baseElev;
 
-    // Canal cells are dug below surrounding terrain
-    const elevation = canalSet.has(key)
-      ? elevMap[idx] - CANAL_DEPTH
-      : elevMap[idx];
-
-    return createCell(col, row, { elevation }, type);
-  });
-  */
-  const cells: Array<I_cell> = []
-  for(let row = 0; row < rows; row++)
-  {
-    for(let col = 0; col < cols; col++)
-    {
-      const type: string = typeMap[row*col+col] ?? "null";
-      const elevation: number = elevMap[row*col+col] ?? -1;
-      if(type === "null") cells.push(createCell(col, row, {elevation: -1}, type))
-      else if(type === "terrain") cells.push(createCell(col, row, {elevation: elevation}, type))
-      switch(type) {
-        case "null":
-          cells.push(createCell(row, col, {elevation: -1}, type))
-          break;
-        case "terrain":
-          cells.push(createCell(row, col, {elevation: elevation}, type))
-          break;
-        case "plot":
-          cells.push(createCell(row, col, {waterLevel: 0, elevation: elevation}, type))
-          break;
-        case "canal":
-          cells.push(createCell(row, col, {waterLevel: 1, elevation: elevation}, type))
-          break;
-        default:
-          cells.push(createCell(col, row, {elevation: -1}, "null"))
-          break;
-      }
+            cells.push(createCell(col, row, { elevation }, type));
+        }
     }
-    return cells
-  }
-  
+
+    return cells;
 }
 
-// ── NEIGHBOR LOOKUP ───────────────────────────────────────────────────────
+// ── NEIGHBOUR LOOKUP ──────────────────────────────────────────────────────
 
 /**
- * getNeighborIndices — 4-directional (N, S, W, E) neighbor indices.
+ * getNeighborIndices — 4-directional (N, S, W, E) neighbour indices.
  * Returns only valid in-bounds indices.
  *
- * @param {number} idx
- * @param {number} cols
- * @param {number} rows
- * @returns {number[]}
+ * @param idx   flat cell index
+ * @param cols  grid width
+ * @param rows  grid height
  */
-export function getNeighborIndices(idx, cols, rows) {
-  const col = idx % cols;
-  const row = Math.floor(idx / cols);
-  const out = [];
-  if (row > 0)         out.push(idx - cols); // N
-  if (row < rows - 1)  out.push(idx + cols); // S
-  if (col > 0)         out.push(idx - 1);    // W
-  if (col < cols - 1)  out.push(idx + 1);    // E
-  return out;
+export function getNeighborIndices(
+    idx:  number,
+    cols: number,
+    rows: number
+): number[] {
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+    const neighbours: number[] = [];
+    if (row > 0)         neighbours.push(idx - cols); // N
+    if (row < rows - 1)  neighbours.push(idx + cols); // S
+    if (col > 0)         neighbours.push(idx - 1);    // W
+    if (col < cols - 1)  neighbours.push(idx + 1);    // E
+    return neighbours;
+}
+
+// ── FLOW OPTIONS & TRANSFER TYPES ────────────────────────────────────────
+
+/**
+ * FlowOptions — runtime-configurable knobs for computeFlows.
+ *
+ * elevationKey   which cell.props field drives flow        default 'elevation'
+ * flowRate       max fraction of water transferred/tick   default 0.06
+ * maxElevDiff    normalisation ceiling in metres           default 8
+ *
+ * Bernoulli upgrade: add crossSection, tickMs, cellCapacity here.
+ */
+export interface FlowOptions {
+    elevationKey?: string;
+    flowRate?:     number;
+    maxElevDiff?:  number;
+}
+
+/** A single computed water transfer between two cells. */
+export interface Transfer {
+    fromIdx: number;
+    toIdx:   number;
+    amount:  number;
 }
 
 // ── FLOW COMPUTATION ──────────────────────────────────────────────────────
@@ -267,177 +257,204 @@ export function getNeighborIndices(idx, cols, rows) {
  * computeFlows — reads elevation (or any configured prop) and computes
  * the water transfer amounts across all downhill cell pairs this tick.
  *
- * This is the ONLY function that encodes the flow physics.
- * Upgrading to Bernoulli means changing the `amount` line here only.
+ * This is the ONLY function that encodes flow physics.
+ * Upgrading to Bernoulli means changing the `amount` line only.
  *
- * @param {Cell[]}  grid
- * @param {number}  cols
- * @param {number}  rows
- * @param {object}  gateMap   { cellId: gate }  — closed gates block flow
- * @param {object}  options
- *   @param {string} options.elevationKey   which props key drives flow  ('elevation')
- *   @param {number} options.flowRate       max fraction transferred per tick (0.06)
- *   @param {number} options.maxElevDiff    normalisation ceiling in metres  (8)
+ * ── Flow restriction ──────────────────────────────────────────────────────
+ * Only 'source', 'canal', and 'plot' cells participate in flow.
+ * 'terrain' cells are skipped both as sources and as destinations.
+ * This keeps water in the irrigation network and prevents uncontrolled
+ * spreading over raw terrain.
  *
- * @returns {{ fromIdx: number, toIdx: number, amount: number }[]}
+ * @param grid      current grid state
+ * @param cols      grid width
+ * @param rows      grid height
+ * @param gateMap   { cellId: gate } — closed gates block flow
+ * @param options   FlowOptions
+ * @returns         array of Transfer objects
  */
-export function computeFlows(grid, cols, rows, gateMap, options = {}) {
-  const {
-    elevationKey = "elevation",
-    flowRate     = 0.5,
-    maxElevDiff  = 8,
-  } = options;
+export function computeFlows(
+    grid:    I_cell[],
+    cols:    number,
+    rows:    number,
+    gateMap: Record<string, { isOpen: boolean }>,
+    options: FlowOptions = {}
+): Transfer[] {
+    const {
+        elevationKey = "elevation",
+        flowRate     = 0.5,
+        maxElevDiff  = 8,
+    } = options;
 
-  const transfers = [];
+    const transfers: Transfer[] = [];
 
-  for (let idx = 0; idx < grid.length; idx++) {
-    const cell = grid[idx];
+    for (let idx = 0; idx < grid.length; idx++) {
+        const cell = grid[idx]!;
 
-    // Skip dry cells — nothing to move
-    if (cell.waterLevel < 0.001) continue;
+        // ── Flow type check ────────────────────────────────────────────────
+        // Terrain cells are inert — skip them as flow sources entirely.
+        if (cell.type === "terrain") continue;
 
-    // Closed gate: this cell acts as a dam, blocking all outflow
-    if (gateMap[cell.id]?.isOpen === false) continue;
+        // Skip dry cells
+        if (cell.waterLevel < 0.001) continue;
 
-    const cellElev = cell.props[elevationKey];
+        // Closed gate: this cell is a dam — blocks all outflow
+        if (gateMap[cell.id]?.isOpen === false) continue;
 
-    // Collect all lower-elevation, non-gate-blocked neighbors
-    const downhill = getNeighborIndices(idx, cols, rows).filter(ni => {
-      if (gateMap[grid[ni].id]?.isOpen === false) return false;
-      return grid[ni].props[elevationKey] < cellElev;
-    });
+        const cellElev = cell.props[elevationKey];
 
-    if (downhill.length === 0) continue;
+        // Find downhill neighbours that are in the flow network
+        const downhill = getNeighborIndices(idx, cols, rows).filter(ni => {
+            const neighbour = grid[ni];
+            if (!neighbour) return false;
 
-    // Total elevation drop: used to distribute flow proportionally
-    // so a cell with two downhill neighbors splits flow between them
-    const totalDiff = downhill.reduce(
-        (sum, ni) => sum + (cellElev - grid[ni].props[elevationKey]),
-        0
-    );
+            // Terrain cells are excluded as destinations as well
+            if (neighbour.type === "terrain") return false;
 
-    for (const ni of downhill) {
-      const elevDiff = cellElev - grid[ni].props[elevationKey];
+            // Closed gate blocks inflow from this direction
+            if (gateMap[neighbour.id]?.isOpen === false) return false;
 
-      // Fraction of this cell's outflow directed at this neighbor
-      const fraction = elevDiff / totalDiff;
+            return neighbour.props[elevationKey] < cellElev;
+        });
 
-      // elevFactor: steeper gradient → faster flow.
-      // Clamped to [0, 1] to prevent instability on very steep drops.
-      // ─ Upgrade point ─────────────────────────────────────────────
-      // Replace this with Bernoulli:
-      //   const v   = Math.sqrt(2 * 9.81 * elevDiff);
-      //   const Q   = v * (options.crossSection ?? 1);
-      //   const amt = (Q * (options.tickMs ?? 160) / 1000) / (options.cellCapacity ?? 100);
-      // ─────────────────────────────────────────────────────────────
-      const elevFactor = Math.min(elevDiff / maxElevDiff, 1);
-      const amount     = Math.min(
-        cell.waterLevel * flowRate * elevFactor * fraction,
-        cell.waterLevel * fraction // hard cap: can't give more than available
-      );
+        if (downhill.length === 0) continue;
 
-      if (amount > 0.0001) {
-        transfers.push({ fromIdx: idx, toIdx: ni, amount });
-      }
+        // Total elevation drop — used to distribute flow proportionally
+        const totalDiff = downhill.reduce(
+            (sum, ni) => sum + (cellElev - grid[ni].props[elevationKey]),
+            0
+        );
+
+        for (const ni of downhill) {
+            const elevDiff = cellElev - grid[ni].props[elevationKey];
+            const fraction = elevDiff / totalDiff;
+
+            // elevFactor: steeper gradient → faster flow.
+            // Clamped to [0,1] to prevent instability on extreme drops.
+            //
+            // ─ Bernoulli upgrade point ──────────────────────────────────
+            // Replace these two lines:
+            //   const v   = Math.sqrt(2 * 9.81 * elevDiff);
+            //   const Q   = v * (options.crossSection ?? 1);
+            //   const amt = (Q * (options.tickMs ?? 160) / 1000)
+            //               / (options.cellCapacity ?? 100);
+            //   const amount = Math.min(amt * fraction, cell.waterLevel * fraction);
+            // ─────────────────────────────────────────────────────────────
+            const elevFactor = Math.min(elevDiff / maxElevDiff, 1);
+            const amount     = Math.min(
+                cell.waterLevel * flowRate * elevFactor * fraction,
+                cell.waterLevel * fraction // can't transfer more than available
+            );
+
+            if (amount > 0.0001) {
+                transfers.push({ fromIdx: idx, toIdx: ni, amount });
+            }
+        }
     }
-  }
 
-  return transfers;
+    return transfers;
 }
 
 // ── APPLY FLOWS ───────────────────────────────────────────────────────────
 
 /**
- * applyFlows — immutably applies computed transfers to waterLevels.
- * Source cells are always restored to 1.0 (infinite reservoir).
+ * applyFlows — immutably applies computed transfers to water levels.
+ * Source cells are always restored to waterLevel = 1.0 (infinite reservoir).
  *
- * Returns a new grid array — the input is never mutated.
+ * Returns a new grid array — input is never mutated.
  *
- * @param {Cell[]}   grid
- * @param {object[]} transfers   from computeFlows
- * @param {string[]} sourceIds   cell ids that are infinite sources
- * @returns {Cell[]}
+ * @param grid      current grid state
+ * @param transfers from computeFlows
+ * @param sourceIds cell ids of infinite-source cells
  */
-export function applyFlows(grid, transfers, sourceIds) {
-  const sourceSet = new Set(sourceIds);
+export function applyFlows(
+    grid:      I_cell[],
+    transfers: Transfer[],
+    sourceIds: string[]
+): I_cell[] {
+    const sourceSet = new Set(sourceIds);
+    const levels    = grid.map(c => c.waterLevel);
 
-  // Work on a mutable level array; rebuild immutably at the end
-  const levels = grid.map(c => c.waterLevel);
-
-  for (const { fromIdx, toIdx, amount } of transfers) {
-    // Sources don't drain
-    if (!sourceSet.has(grid[fromIdx].id)) {
-      levels[fromIdx] = Math.max(0, levels[fromIdx] - amount);
+    for (const { fromIdx, toIdx, amount } of transfers) {
+        // Sources don't drain — they're the infinite reservoir
+        if (!sourceSet.has(grid[fromIdx].id)) {
+            levels[fromIdx] = Math.max(0, levels[fromIdx] - amount);
+        }
+        levels[toIdx] = Math.min(1, levels[toIdx] + amount);
     }
-    // Plots and terrain cells accumulate, capped at 1.0
-    levels[toIdx] = Math.min(1, levels[toIdx] + amount);
-  }
 
-  // Restore sources (infinite reservoir)
-  for (const id of sourceIds) {
-    const i = grid.findIndex(c => c.id === id);
-    if (i >= 0) levels[i] = 1.0;
-  }
+    // Restore source cells to full regardless of what drained them
+    for (const id of sourceIds) {
+        const i = grid.findIndex(c => c.id === id);
+        if (i >= 0) levels[i] = 1.0;
+    }
 
-  return grid.map((cell, i) => ({ ...cell, waterLevel: levels[i] }));
+    return grid.map((cell, i) => ({ ...cell, waterLevel: levels[i] }));
 }
 
 // ── SIMULATION TICK ───────────────────────────────────────────────────────
 
 /**
  * simulationTick — one complete simulation step.
- * Designed to be called by setInterval in the React component.
+ * Called by setInterval in the React component.
  *
- * @param {Cell[]}   grid
- * @param {number}   cols
- * @param {number}   rows
- * @param {object}   gateMap    { cellId: gate }
- * @param {string[]} sourceIds  cell ids of source cells
- * @param {object}   options    forwarded to computeFlows
- * @returns {Cell[]}  next grid state
+ * @param grid      current grid state
+ * @param cols      grid width
+ * @param rows      grid height
+ * @param gateMap   { cellId: gate }
+ * @param sourceIds cell ids of source cells
+ * @param options   forwarded to computeFlows
+ * @returns         next grid state
  */
-export function simulationTick(grid, cols, rows, gateMap, sourceIds, options) {
-  const transfers = computeFlows(grid, cols, rows, gateMap, options);
-  return applyFlows(grid, transfers, sourceIds);
+export function simulationTick(
+    grid:      I_cell[],
+    cols:      number,
+    rows:      number,
+    gateMap:   Record<string, { isOpen: boolean }>,
+    sourceIds: string[],
+    options?:  FlowOptions
+): I_cell[] {
+    const transfers = computeFlows(grid, cols, rows, gateMap, options);
+    return applyFlows(grid, transfers, sourceIds);
 }
 
 // ── PLOT WATER LEVEL ──────────────────────────────────────────────────────
 
 /**
- * plotWaterLevel — aggregates the average waterLevel of all terrain
- * cells inside a plot polygon's bounding box.
+ * plotWaterLevel — average waterLevel of all plot cells inside a
+ * plot polygon's bounding box.
  *
- * This lives in physics.js because it reads grid cell state,
- * not because it has anything to do with rendering.
+ * Lives in physics.js because it reads grid cell state, not canvas state.
  *
- * @param {object}  plot    { polygon: [[col, row], ...] }
- * @param {Cell[]}  grid
- * @param {number}  cols
- * @returns {number}  0.0 – 1.0
+ * @param plot   { polygon: [[col, row], ...] }
+ * @param grid   current grid state
+ * @param cols   grid width
+ * @returns      0.0 – 1.0
  */
-export function plotWaterLevel(plot, grid, cols) {
-    const plotCols  = plot.polygon.map(([c]) => c);
-    const plotRows  = plot.polygon.map(([, r]) => r);
-    const colMin = Math.min(...plotCols);
-    const colMax = Math.max(...plotCols);
-    const rowMin = Math.min(...plotRows);
-    const rowMax = Math.max(...plotRows);
+export function plotWaterLevel(
+    plot: { polygon: [number, number][] },
+    grid: I_cell[],
+    cols: number
+): number {
+    const plotCols = plot.polygon.map(([c]) => c);
+    const plotRows = plot.polygon.map(([, r]) => r);
+    const colMin   = Math.min(...plotCols);
+    const colMax   = Math.max(...plotCols);
+    const rowMin   = Math.min(...plotRows);
+    const rowMax   = Math.max(...plotRows);
 
-    let total = 0, count = 0;
-    let cells = [];
+    let total = 0;
+    let count = 0;
+
     for (let r = rowMin; r < rowMax; r++) {
         for (let c = colMin; c < colMax; c++) {
-        const cell = grid[r * cols + c];
-            if (!cell || cell.type === "canal" || cell.type === "source") continue;
+            const cell = grid[r * cols + c];
+            // Only count plot cells — canals and terrain are excluded
+            if (!cell || cell.type !== "plot") continue;
             total += cell.waterLevel;
             count++;
-            console.log(`${plot.id}: wl: ${total/count}, cell: ${cell.waterLevel}, count: ${count}`)
-            //cells.push(cell)
         }
     }
-
-    //console.log(`${plot.id}: wl: ${total/count}, total: ${total}, count: ${count}`)
-    //console.log(`${cells[0].id}`)
 
     return count > 0 ? total / count : 0;
 }
@@ -445,34 +462,39 @@ export function plotWaterLevel(plot, grid, cols) {
 // ── GRID HELPERS ──────────────────────────────────────────────────────────
 
 /**
- * buildInitialGrid — convenience function used by the React component
- * to construct a fresh grid from network data.
- * Exported separately so the component doesn't need to know about
- * buildElevationMap, buildGrid, or CANAL_DEPTH.
+ * buildInitialGrid — convenience wrapper used by the React component.
  *
- * @param {number}  cols
- * @param {number}  rows
- * @param {object}  data  — DEMO_DATA shape
- * @returns {Cell[]}
+ * Note: parameter order is (cols, rows, data) to match the existing
+ * call-site in IrrigationDigitalTwin.tsx. Internally it forwards
+ * (rows, cols) to buildMap and buildGrid which use row-first order.
+ *
+ * @param cols  grid width
+ * @param rows  grid height
+ * @param data  I_network_data (DEMO_DATA or real GeoJSON-derived data)
+ * @returns     grid with source cells initialised to waterLevel = 1.0
  */
-export function buildInitialGrid(cols, rows, data) {
-  const allCanalCoords = data.canals.flatMap(c => c.waypoints);
-  const elevMap        = buildElevationMap(cols, rows);
-  const grid           = buildGrid(cols, rows, elevMap, allCanalCoords, data.sources);
-  return grid.map(cell =>
-    cell.type === "source" ? { ...cell, waterLevel: 1.0 } : cell
-  );
+export function buildInitialGrid(
+    cols: number,
+    rows: number,
+    data: I_network_data
+): I_cell[] {
+    const { elevationMap, typeMap } = buildMap(rows, cols, data.mapData);
+    const grid                      = buildGrid(rows, cols, elevationMap, typeMap);
+
+    return grid.map(cell =>
+        cell.type === "source" ? { ...cell, waterLevel: 1.0 } : cell
+    );
 }
 
 /**
  * buildElevRange — min/max elevation across the grid.
- * Used by the renderer to normalize the terrain color scale.
- * Computed once on the initial grid and stored in a ref.
+ * Used by the renderer to normalise the terrain colour scale.
+ * Compute once on the initial grid and cache in a ref.
  *
- * @param {Cell[]} grid
- * @returns {[number, number]}  [min, max]
+ * @param grid  any grid snapshot (initial grid is sufficient)
+ * @returns     [minElev, maxElev]
  */
-export function buildElevRange(grid) {
-  const elevs = grid.map(c => c.props.elevation);
-  return [Math.min(...elevs), Math.max(...elevs)];
+export function buildElevRange(grid: I_cell[]): [number, number] {
+    const elevs = grid.map(c => c.props.elevation);
+    return [Math.min(...elevs), Math.max(...elevs)];
 }
